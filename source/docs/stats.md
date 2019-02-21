@@ -1,20 +1,20 @@
 # Envoy Stats System
 
 Envoy statistics track numeric metrics on an Envoy instance, optionally spanning
-binary restarts. The metrics are tracked as:
+binary program restarts. The metrics are tracked as:
 
  * Counters: strictly increasing 64-bit integers.
  * Gauges: 64-bit integers that can rise and fall.
  * Histograms: mapping ranges of values to frequency. The ranges are auto-adjusted as
    data accumulates. Unliked counters and gauges, histogram data is not retained across
-   binary restarts.
+   binary program restarts.
 
 ## Hot-restart: `RawStatData` vs `HeapStatData`
 
-In order to support restarting the Envoy binary without losing counter and gauge
+In order to support restarting the Envoy binary program without losing counter and gauge
 values, they are stored in a shared-memory block, including stats that are
 created dynamically at runtime in response to discovery of new clusters at
-runtime. To simplify memmory management, each stat is allocated a fixed amount
+runtime. To simplify memory management, each stat is allocated a fixed amount
 of storage, controlled via [command-line
 flags](https://www.envoyproxy.io/docs/envoy/latest/operations/cli):
 `--max-stats` and `--max-obj-name-len`, which determine the size of the pre-allocated
@@ -26,7 +26,7 @@ it easy to correlate stats across restarts even as the dynamic cluster
 configuration changes.
 
 One challenge with this fixed memory allocation strategy is that it limits
-cluster scalabilty. A deployment wishing to use a single Envoy instance to
+cluster scalability. A deployment wishing to use a single Envoy instance to
 manage tens of thousands of clusters, each with its own set of scoped stats,
 will use more memory than is ideal.
 
@@ -102,8 +102,6 @@ followed.
 Stat names are replicated in several places in various forms.
 
  * Held fully elaborated next to the values, in `RawStatData` and `HeapStatData`
- * As keys of multiple maps in `ThreadLocalStore` for capturing all stats in a scope,
-   and each per-thread caches.
  * In [MetricImpl](https://github.com/envoyproxy/envoy/blob/master/source/common/stats/metric_impl.h)
    in a transformed state, with tags extracted into vectors of name/value strings.
  * In static strings across the codebase where stats are referenced
@@ -111,9 +109,17 @@ Stat names are replicated in several places in various forms.
    regexes](https://github.com/envoyproxy/envoy/blob/master/source/common/config/well_known_names.cc)
    used to perform tag extraction.
 
-These copies -- particularly the keys in thread-local storage -- multiply the
-stat name storage, making stat names dominate memory usage, particularly for
-deployments with large numbers of clusters and threads.
+There are stat maps in `ThreadLocalStore` for capturing all stats in a scope,
+and each per-thread caches. However, they don't duplicate the stat
+names. Instead, they reference the `char*` held in the `RawStatData` or
+`HeapStatData itself, and thus are relatively cheap; effectively those maps are
+all pointer-to-pointer.
+
+For this to be safe, cache lookups from locally scoped strings must use `.find`
+rather than `operator[]`, as the latter would insert a pointer to a temporary as
+the key. If the `.find` fails, the actual stat must be constructed first, and
+then inserted into the map using its key storage. This strategy saves
+duplication of the keys, but costs an extra map lookup on each miss.
 
 ## Tags and Tag Extraction
 

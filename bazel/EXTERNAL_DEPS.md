@@ -1,3 +1,11 @@
+# Choosing tarballs
+
+Where the dependency maintainer provides a tarball, prefer that over the
+automatically generated Github tarball. Github generated tarball SHA256
+values can change when Github change their tar/gzip libraries breaking
+builds. Maintainer provided tarballs are more stable and the maintainer
+can provide the SHA256.
+
 # Adding external dependencies to Envoy (native Bazel)
 
 This is the preferred style of adding dependencies that use Bazel for their
@@ -8,6 +16,18 @@ build process.
 2. Reference your new external dependency in some `envoy_cc_library` via the
    `external_deps` attribute.
 3. `bazel test //test/...`
+
+# Adding external dependencies to Envoy (external CMake)
+
+This is the preferred style of adding dependencies that use CMake for their build system.
+
+1. Define a the source Bazel repository in [`bazel/repositories.bzl`](repositories.bzl), in the
+   `envoy_dependencies()` function.
+2. Add a `cmake_external` rule to [`bazel/foreign_cc/BUILD`](bazel/foreign_cc/BUILD). This will
+   reference the source repository in step 1.
+3. Reference your new external dependency in some `envoy_cc_library` via the name bound in step 1
+   `external_deps` attribute.
+4. `bazel test //test/...`
 
 # Adding external dependencies to Envoy (genrule repository)
 
@@ -36,8 +56,9 @@ to binaries, libraries, headers, etc.
 
 # Adding external dependencies to Envoy (build recipe)
 
-This is the older style of adding dependencies. It uses shell scripts to build
-and install dependencies into a shared directory prefix.
+This is the older style of adding dependencies. It uses shell scripts to build and install
+dependencies into a shared directory prefix. This should no longer be used unless there are
+extenuating circumstances.
 
 1. Add a build recipe X in [`ci/build_container/build_recipes`](../ci/build_container/build_recipes)
    for developer-local and CI external dependency build flows.

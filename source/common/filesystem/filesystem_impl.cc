@@ -7,49 +7,73 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 
 #include "envoy/common/exception.h"
-#include "envoy/common/platform.h"
 #include "envoy/common/time.h"
 #include "envoy/event/dispatcher.h"
+#include "envoy/thread/thread.h"
 
 #include "common/api/os_sys_calls_impl.h"
 #include "common/common/assert.h"
 #include "common/common/fmt.h"
 #include "common/common/lock_guard.h"
-#include "common/common/thread.h"
+#include "common/common/stack_array.h"
 
 #include "absl/strings/match.h"
 
 namespace Envoy {
 namespace Filesystem {
 
-bool fileExists(const std::string& path) {
+InstanceImpl::InstanceImpl(std::chrono::milliseconds file_flush_interval_msec,
+                           Thread::ThreadFactory& thread_factory, Stats::Store& stats_store)
+    : file_flush_interval_msec_(file_flush_interval_msec),
+      file_stats_{FILESYSTEM_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
+                                   POOL_GAUGE_PREFIX(stats_store, "filesystem."))},
+      thread_factory_(thread_factory) {}
+
+FileSharedPtr InstanceImpl::createFile(const std::string& path, Event::Dispatcher& dispatcher,
+                                       Thread::BasicLockable& lock,
+                                       std::chrono::milliseconds file_flush_interval_msec) {
+  return std::make_shared<Filesystem::FileImpl>(path, dispatcher, lock, file_stats_,
+                                                file_flush_interval_msec, thread_factory_);
+};
+
+FileSharedPtr InstanceImpl::createFile(const std::string& path, Event::Dispatcher& dispatcher,
+                                       Thread::BasicLockable& lock) {
+  return createFile(path, dispatcher, lock, file_flush_interval_msec_);
+}
+
+bool InstanceImpl::fileExists(const std::string& path) {
   std::ifstream input_file(path);
   return input_file.is_open();
 }
 
-bool directoryExists(const std::string& path) {
-  DIR* const dir = opendir(path.c_str());
+bool InstanceImpl::directoryExists(const std::string& path) {
+  DIR* const dir = ::opendir(path.c_str());
   const bool dir_exists = nullptr != dir;
   if (dir_exists) {
-    closedir(dir);
+    ::closedir(dir);
   }
 
   return dir_exists;
 }
 
-ssize_t fileSize(const std::string& path) {
+ssize_t InstanceImpl::fileSize(const std::string& path) {
   struct stat info;
-  if (stat(path.c_str(), &info) != 0) {
+  if (::stat(path.c_str(), &info) != 0) {
     return -1;
   }
   return info.st_size;
 }
 
-std::string fileReadToEnd(const std::string& path) {
+std::string InstanceImpl::fileReadToEnd(const std::string& path) {
+  if (illegalPath(path)) {
+    throw EnvoyException(fmt::format("Invalid path: {}", path));
+  }
+
   std::ios::sync_with_stdio(false);
 
   std::ifstream file(path);
@@ -63,53 +87,55 @@ std::string fileReadToEnd(const std::string& path) {
   return file_string.str();
 }
 
-std::string canonicalPath(const std::string& path) {
+Api::SysCallStringResult InstanceImpl::canonicalPath(const std::string& path) {
   // TODO(htuch): When we are using C++17, switch to std::filesystem::canonical.
   char* resolved_path = ::realpath(path.c_str(), nullptr);
   if (resolved_path == nullptr) {
-    throw EnvoyException(fmt::format("Unable to determine canonical path for {}", path));
+    return {std::string(), errno};
   }
   std::string resolved_path_string{resolved_path};
-  free(resolved_path);
-  return resolved_path_string;
+  ::free(resolved_path);
+  return {resolved_path_string, 0};
 }
 
-bool illegalPath(const std::string& path) {
-  try {
-    const std::string canonical_path = canonicalPath(path);
-    // Platform specific path sanity; we provide a convenience to avoid Envoy
-    // instances poking in bad places. We may have to consider conditioning on
-    // platform in the future, growing these or relaxing some constraints (e.g.
-    // there are valid reasons to go via /proc for file paths).
-    // TODO(htuch): Optimize this as a hash lookup if we grow any further.
-    if (absl::StartsWith(canonical_path, "/dev") || absl::StartsWith(canonical_path, "/sys") ||
-        absl::StartsWith(canonical_path, "/proc")) {
-      return true;
-    }
-    return false;
-  } catch (const EnvoyException& ex) {
-    ENVOY_LOG_MISC(debug, "Unable to determine canonical path for {}: {}", path, ex.what());
+bool InstanceImpl::illegalPath(const std::string& path) {
+  const Api::SysCallStringResult canonical_path = canonicalPath(path);
+  if (canonical_path.rc_.empty()) {
+    ENVOY_LOG_MISC(debug, "Unable to determine canonical path for {}: {}", path,
+                   ::strerror(canonical_path.errno_));
     return true;
   }
+
+  // Platform specific path sanity; we provide a convenience to avoid Envoy
+  // instances poking in bad places. We may have to consider conditioning on
+  // platform in the future, growing these or relaxing some constraints (e.g.
+  // there are valid reasons to go via /proc for file paths).
+  // TODO(htuch): Optimize this as a hash lookup if we grow any further.
+  if (absl::StartsWith(canonical_path.rc_, "/dev") ||
+      absl::StartsWith(canonical_path.rc_, "/sys") ||
+      absl::StartsWith(canonical_path.rc_, "/proc")) {
+    return true;
+  }
+  return false;
 }
 
 FileImpl::FileImpl(const std::string& path, Event::Dispatcher& dispatcher,
-                   Thread::BasicLockable& lock, Stats::Store& stats_store,
-                   std::chrono::milliseconds flush_interval_msec)
+                   Thread::BasicLockable& lock, FileSystemStats& stats,
+                   std::chrono::milliseconds flush_interval_msec,
+                   Thread::ThreadFactory& thread_factory)
     : path_(path), file_lock_(lock), flush_timer_(dispatcher.createTimer([this]() -> void {
         stats_.flushed_by_timer_.inc();
         flush_event_.notifyOne();
         flush_timer_->enableTimer(flush_interval_msec_);
       })),
-      os_sys_calls_(Api::OsSysCallsSingleton::get()), flush_interval_msec_(flush_interval_msec),
-      stats_{FILESYSTEM_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
-                              POOL_GAUGE_PREFIX(stats_store, "filesystem."))} {
+      os_sys_calls_(Api::OsSysCallsSingleton::get()), thread_factory_(thread_factory),
+      flush_interval_msec_(flush_interval_msec), stats_(stats) {
   open();
 }
 
 void FileImpl::open() {
-  Api::SysCallIntResult result = os_sys_calls_.open(path_.c_str(), O_RDWR | O_APPEND | O_CREAT,
-                                                    S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+  Api::SysCallIntResult result =
+      os_sys_calls_.open(path_, O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
   fd_ = result.rc_;
   if (-1 == fd_) {
     throw EnvoyException(
@@ -142,8 +168,8 @@ FileImpl::~FileImpl() {
 
 void FileImpl::doWrite(Buffer::Instance& buffer) {
   uint64_t num_slices = buffer.getRawSlices(nullptr, 0);
-  STACK_ALLOC_ARRAY(slices, Buffer::RawSlice, num_slices);
-  buffer.getRawSlices(slices, num_slices);
+  STACK_ARRAY(slices, Buffer::RawSlice, num_slices);
+  buffer.getRawSlices(slices.begin(), num_slices);
 
   // We must do the actual writes to disk under lock, so that we don't intermix chunks from
   // different FileImpl pointing to the same underlying file. This can happen either via hot
@@ -155,8 +181,7 @@ void FileImpl::doWrite(Buffer::Instance& buffer) {
   //            process lock or had multiple locks.
   {
     Thread::LockGuard lock(file_lock_);
-    for (uint64_t i = 0; i < num_slices; i++) {
-      Buffer::RawSlice& slice = slices[i];
+    for (const Buffer::RawSlice& slice : slices) {
       const Api::SysCallSizeResult result = os_sys_calls_.write(fd_, slice.mem_, slice.len_);
       ASSERT(result.rc_ == static_cast<ssize_t>(slice.len_));
       stats_.write_completed_.inc();
@@ -249,7 +274,7 @@ void FileImpl::write(absl::string_view data) {
 }
 
 void FileImpl::createFlushStructures() {
-  flush_thread_.reset(new Thread::Thread([this]() -> void { flushThreadFunc(); }));
+  flush_thread_ = thread_factory_.createThread([this]() -> void { flushThreadFunc(); });
   flush_timer_->enableTimer(flush_interval_msec_);
 }
 

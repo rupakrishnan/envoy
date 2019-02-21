@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "envoy/api/api.h"
 #include "envoy/api/os_sys_calls.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/filesystem/filesystem.h"
@@ -32,45 +33,31 @@ struct FileSystemStats {
 namespace Filesystem {
 
 /**
- * @return bool whether a file exists on disk and can be opened for read.
+ * Captures state, properties, and stats of a file-system.
  */
-bool fileExists(const std::string& path);
+class InstanceImpl : public Instance {
+public:
+  InstanceImpl(std::chrono::milliseconds file_flush_interval_msec,
+               Thread::ThreadFactory& thread_factory, Stats::Store& store);
 
-/**
- * @return bool whether a directory exists on disk and can be opened for read.
- */
-bool directoryExists(const std::string& path);
+  // Filesystem::Instance
+  FileSharedPtr createFile(const std::string& path, Event::Dispatcher& dispatcher,
+                           Thread::BasicLockable& lock,
+                           std::chrono::milliseconds file_flush_interval_msec) override;
+  FileSharedPtr createFile(const std::string& path, Event::Dispatcher& dispatcher,
+                           Thread::BasicLockable& lock) override;
+  bool fileExists(const std::string& path) override;
+  bool directoryExists(const std::string& path) override;
+  ssize_t fileSize(const std::string& path) override;
+  std::string fileReadToEnd(const std::string& path) override;
+  Api::SysCallStringResult canonicalPath(const std::string& path) override;
+  bool illegalPath(const std::string& path) override;
 
-/**
- * @return ssize_t the size in bytes of the specified file, or -1 if the file size
- *                 cannot be determined for any reason, including without limitation
- *                 the non-existence of the file.
- */
-ssize_t fileSize(const std::string& path);
-
-/**
- * @return full file content as a string.
- * @throw EnvoyException if the file cannot be read.
- * Be aware, this is not most highly performing file reading method.
- */
-std::string fileReadToEnd(const std::string& path);
-
-/**
- * @param path some filesystem path.
- * @return std::string the canonical path (see realpath(3)).
- */
-std::string canonicalPath(const std::string& path);
-
-/**
- * Determine if the path is on a list of paths Envoy will refuse to access. This
- * is a basic sanity check for users, blacklisting some clearly bad paths. Paths
- * may still be problematic (e.g. indirectly leading to /dev/mem) even if this
- * returns false, it is up to the user to validate that supplied paths are
- * valid.
- * @param path some filesystem path.
- * @return is the path on the blacklist?
- */
-bool illegalPath(const std::string& path);
+private:
+  const std::chrono::milliseconds file_flush_interval_msec_;
+  FileSystemStats file_stats_;
+  Thread::ThreadFactory& thread_factory_;
+};
 
 /**
  * This is a file implementation geared for writing out access logs. It turn out that in certain
@@ -82,7 +69,8 @@ bool illegalPath(const std::string& path);
 class FileImpl : public File {
 public:
   FileImpl(const std::string& path, Event::Dispatcher& dispatcher, Thread::BasicLockable& lock,
-           Stats::Store& stats_store, std::chrono::milliseconds flush_interval_msec);
+           FileSystemStats& stats_, std::chrono::milliseconds flush_interval_msec,
+           Thread::ThreadFactory& thread_factory);
   ~FileImpl();
 
   // Filesystem::File
@@ -96,7 +84,7 @@ public:
    */
   void reopen() override;
 
-  // Fileystem::File
+  // Filesystem::File
   void flush() override;
 
 private:
@@ -119,7 +107,7 @@ private:
                                           // to disk. This is used to make sure that file blocks do
                                           // not get interleaved by multiple processes writing to
                                           // the same file during hot-restart.
-  Thread::MutexBasicLockable flush_lock_; // This lock is used to prevent simulataneous flushes from
+  Thread::MutexBasicLockable flush_lock_; // This lock is used to prevent simultaneous flushes from
                                           // the flush thread and a synchronous flush. This protects
                                           // concurrent access to the about_to_write_buffer_, fd_,
                                           // and all other data used during flushing and file
@@ -146,10 +134,11 @@ private:
                                             // final write to disk.
   Event::TimerPtr flush_timer_;
   Api::OsSysCalls& os_sys_calls_;
+  Thread::ThreadFactory& thread_factory_;
   const std::chrono::milliseconds flush_interval_msec_; // Time interval buffer gets flushed no
                                                         // matter if it reached the MIN_FLUSH_SIZE
                                                         // or not.
-  FileSystemStats stats_;
+  FileSystemStats& stats_;
 };
 
 } // namespace Filesystem
